@@ -89,8 +89,15 @@ func (r *k8sServiceRepository) Delete(ctx context.Context, namespace, name strin
 	return r.client.Resource(r.gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
+// Fields of the Release spec the server manages. Update writes only these and
+// keeps everything else (extensions, protected, roles, ...) as found.
+var (
+	managedSpecFields    = []string{"description", "parameters", "contexts", "targetNamespace", "createNamespace"}
+	managedPackageFields = []string{"repository", "tag", "interval", "timeout", "insecure"}
+)
+
 func (r *k8sServiceRepository) Update(ctx context.Context, namespace string, release *crd.Release) error {
-	unstructuredMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(release)
+	desired, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&release.Spec)
 	if err != nil {
 		return fmt.Errorf("failed to convert Release to unstructured: %w", err)
 	}
@@ -100,11 +107,37 @@ func (r *k8sServiceRepository) Update(ctx context.Context, namespace string, rel
 		return err
 	}
 
-	obj := &unstructured.Unstructured{Object: unstructuredMap}
-	obj.SetResourceVersion(existing.GetResourceVersion())
+	obj := existing.DeepCopy()
+	obj.SetLabels(release.Labels)
+	obj.SetAnnotations(release.Annotations)
+
+	spec, _, _ := unstructured.NestedMap(obj.Object, "spec")
+	if spec == nil {
+		spec = map[string]any{}
+	}
+	mergeFields(spec, desired, managedSpecFields)
+	pkg, _, _ := unstructured.NestedMap(spec, "package")
+	if pkg == nil {
+		pkg = map[string]any{}
+	}
+	desiredPkg, _ := desired["package"].(map[string]any)
+	mergeFields(pkg, desiredPkg, managedPackageFields)
+	spec["package"] = pkg
+	obj.Object["spec"] = spec
 
 	_, err = r.client.Resource(r.gvr).Namespace(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	return err
+}
+
+// mergeFields copies keys from src into dst, deleting from dst those absent in src.
+func mergeFields(dst, src map[string]any, keys []string) {
+	for _, k := range keys {
+		if v, ok := src[k]; ok {
+			dst[k] = v
+		} else {
+			delete(dst, k)
+		}
+	}
 }
 
 func (r *k8sServiceRepository) Watch(ctx context.Context, namespace, project string) (watch.Interface, error) {
